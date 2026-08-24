@@ -148,5 +148,102 @@ class TestMistral4AdaptWeightName(CustomTestCase):
         self.assertIn(name, out)
 
 
+class TestMistral4ExpertScaleMappingIntegration(CustomTestCase):
+    """The adapter's per-expert names must resolve through the REAL deepseek_v2
+    expert mapping to the FusedMoE parameter, proving the activation (input)
+    scale is consumed -- not just that the helper produces a string.
+
+    Uses ``FusedMoE.make_expert_params_mapping`` (the exact mapping
+    deepseek_weight_loader builds) and replays the loader's
+    ``name.replace(weight_name, param_name)`` + ``if name not in params_dict``
+    step against a fake params_dict, exactly like existing MoE loader tests
+    (test_inkling_per_expert_sync) do -- no real quantized layer, CPU only.
+
+    NOTE: whether a block-fp8 *static-activation* FusedMoE actually creates the
+    ``experts.w13_input_scale`` / ``experts.w2_input_scale`` params is the
+    remaining on-device gate (make_expert_input_scale_params_mapping is wired
+    only for W4A8/W4A16). This test proves the NAME threads through so that,
+    when those params exist, the value lands; the fake params_dict includes them.
+    """
+
+    def _resolve(self, checkpoint_name, params_dict, mapping):
+        # Mirror deepseek_weight_loader's expert branch resolution.
+        for param_name, weight_name, expert_id, shard_id in mapping:
+            if weight_name in checkpoint_name:
+                resolved = checkpoint_name.replace(weight_name, param_name)
+                if resolved not in params_dict:
+                    continue
+                return resolved, shard_id, expert_id
+        return None
+
+    def test_gate_up_activation_scale_resolves_to_w13_input_scale(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        num_experts = 2
+        # 1) adapter turns the stacked activation scale into per-expert .input_scale
+        adapted = dict(
+            _adapt_weight_name(
+                "model.layers.0.mlp.experts.gate_up_proj_activation_scale",
+                torch.arange(num_experts).float(),
+            )
+        )
+        gate_key = "model.layers.0.mlp.experts.0.gate_proj.input_scale"
+        up_key = "model.layers.0.mlp.experts.1.up_proj.input_scale"
+        self.assertIn(gate_key, adapted)
+        self.assertIn(up_key, adapted)
+
+        # 2) a FusedMoE exposing the fp8 input-scale params
+        params_dict = {
+            "model.layers.0.mlp.experts.w13_input_scale": object(),
+            "model.layers.0.mlp.experts.w2_input_scale": object(),
+        }
+        mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=num_experts,
+        )
+
+        # 3) gate_proj -> w13 (shard w1), up_proj -> w13 (shard w3)
+        gate_resolved = self._resolve(gate_key, params_dict, mapping)
+        self.assertIsNotNone(gate_resolved)
+        self.assertEqual(
+            gate_resolved[0], "model.layers.0.mlp.experts.w13_input_scale"
+        )
+        self.assertEqual((gate_resolved[1], gate_resolved[2]), ("w1", 0))
+
+        up_resolved = self._resolve(up_key, params_dict, mapping)
+        self.assertEqual(
+            up_resolved[0], "model.layers.0.mlp.experts.w13_input_scale"
+        )
+        self.assertEqual((up_resolved[1], up_resolved[2]), ("w3", 1))
+
+    def test_down_proj_scale_resolves_to_w2(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        adapted = dict(
+            _adapt_weight_name(
+                "model.layers.0.mlp.experts.down_proj_scale_inv",
+                torch.zeros(2, 2, 2),
+            )
+        )
+        down_key = "model.layers.0.mlp.experts.0.down_proj.weight_scale_inv"
+        self.assertIn(down_key, adapted)
+
+        params_dict = {"model.layers.0.mlp.experts.w2_weight_scale_inv": object()}
+        mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=2,
+        )
+        resolved = self._resolve(down_key, params_dict, mapping)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(
+            resolved[0], "model.layers.0.mlp.experts.w2_weight_scale_inv"
+        )
+        self.assertEqual((resolved[1], resolved[2]), ("w2", 0))
+
+
 if __name__ == "__main__":
     unittest.main()

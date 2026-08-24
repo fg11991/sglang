@@ -244,34 +244,51 @@ class Mistral4ForCausalLM(DeepseekV3ForCausalLM):
 
     # ---- post-load validation ---------------------------------------------
 
-    def _assert_key_weights_loaded(self, loaded: set[str]) -> None:
-        """Fail loudly if a structural weight never matched a parameter.
+    def _assert_key_weights_loaded(self, loaded) -> None:
+        """Fail loudly if a structural parameter never received a checkpoint tensor.
 
-        deepseek_v2's loader only *warns* on an unrecognized name, so a silent
-        prefix/naming drift would otherwise train on an uninitialized target.
-        Require the embedding, head, final norm, and layer-0 attention / gate /
-        experts to have been loaded.
+        ``loaded`` is the set of parameter names deepseek_v2's loader actually
+        resolved an incoming tensor to (``do_load_weights`` returns it) -- NOT
+        the raw checkpoint keys, which it records before matching. A silent
+        prefix / expert-naming drift leaves those params at their init value
+        while the loader only *warns*; capture would then proceed on an
+        uninitialized target. Verify the real load happened.
+
+        Patterns are the loader's *post-fusion* parameter names: with
+        ``q_lora_rank`` set, q_a/kv_a fuse into ``fused_qkv_a_proj_with_mqa``, and
+        routed experts fuse into ``experts.w13_weight`` / ``experts.w2_weight``.
+        Match a family across any layer so the check is robust to layer sharding.
+        Assumes the offline-capture pp_size=1 (embed / lm_head / final norm live
+        on the single pipeline rank), which the capture backend guarantees.
         """
+        if loaded is None:
+            logger.warning(
+                "Mistral4ForCausalLM: weight loader returned None; cannot verify "
+                "the target actually loaded (expected DeepseekV2 do_load_weights "
+                "to return its matched-parameter set). Skipping verification."
+            )
+            return
+
         required = [
-            "model.embed_tokens",
-            "lm_head",
+            "embed_tokens.weight",
+            "lm_head.weight",
             "model.norm.weight",
-            "layers.0.self_attn.q_a_proj",
-            "layers.0.self_attn.kv_a_proj_with_mqa",
-            "layers.0.self_attn.o_proj",
-            "layers.0.mlp.gate.weight",
-            "layers.0.mlp.experts",
+            "self_attn.o_proj.weight",
+            "self_attn.kv_b_proj.weight",
+            "mlp.gate.weight",
+            "mlp.experts.w13_weight",
+            "mlp.experts.w2_weight",
         ]
         missing = [
             key for key in required if not any(key in name for name in loaded)
         ]
         if missing:
             raise RuntimeError(
-                "Mistral4ForCausalLM: required target weights did not load "
-                f"(no parameter matched): {missing}. This usually means a "
-                "checkpoint prefix / expert-naming mismatch -- capture would "
-                "otherwise proceed on an uninitialized target. Loaded "
-                f"{len(loaded)} parameters."
+                "Mistral4ForCausalLM: required target parameters were never fed a "
+                f"checkpoint tensor: {missing}. This usually means a checkpoint "
+                "prefix / expert-naming mismatch -- capture would otherwise "
+                f"proceed on an uninitialized target. Matched {len(loaded)} "
+                "parameters."
             )
 
 

@@ -3100,7 +3100,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        self.do_load_weights(weights, is_nextn)
+        # Returns the set of parameter names an incoming tensor actually resolved
+        # to (see do_load_weights). Subclasses (e.g. Mistral4ForCausalLM) rely on
+        # this to verify a real load instead of trusting raw checkpoint keys.
+        return self.do_load_weights(weights, is_nextn)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
