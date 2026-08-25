@@ -34,14 +34,13 @@ hardware and the transformers>=5.3 mistral4 reference:
   1. Logit parity vs the HF mistral4 reference for one prompt -- proves the
      RoPE variant + MoE routing. An offline DSpark capture is only as correct
      as this.
-  2. FP8 static-activation numerics. The plumbing itself is settled, not open:
-     mistral4 is ``activation_scheme: static`` with ``weight_block_size: null``,
-     and Fp8MoEMethod.create_weights registers ``w13_input_scale`` /
-     ``w2_input_scale`` (shape [num_experts]) for exactly that scheme, which the
-     ordinary expert mapping reaches via
-     ``experts.{e}.gate_proj.`` -> ``experts.w13_``. What still needs the device
-     is whether the resulting fp8 path is numerically right on NPU -- covered by
-     the logit-parity check above.
+  2. FP8 static per-tensor numerics. The naming is settled (see
+     _scale_param_name: the checkpoint spells its scales ``..._scale_inv`` but
+     the tensors are per-tensor, so the parameters are ``weight_scale`` /
+     ``w13_weight_scale`` / ``w2_weight_scale`` plus ``input_scale``), and
+     _assert_key_weights_loaded fails loudly if any emitted scale finds no
+     parameter. What still needs the device is whether the resulting fp8 path is
+     numerically right on NPU -- covered by the logit-parity check above.
 ======================================================================
 """
 
@@ -69,16 +68,16 @@ _VISION_MARKERS = ("vision_tower.", "multi_modal_projector.")
 # transformers-v5 stacks routed experts across the expert dim; deepseek_v2's
 # loader (make_expert_params_mapping) consumes per-expert dotted names. Map each
 # checkpoint suffix to the per-expert suffix deepseek_v2 expects.
-_EXPERT_SUFFIX_MAP = {
-    "": ".weight",
-    "_scale_inv": ".weight_scale_inv",
-    "_activation_scale": ".input_scale",
-}
+# Stacked routed-expert tails this adapter understands. The emitted *name* for a
+# weight scale depends on the tensor, not just the tail -- see _scale_param_name.
+_EXPERT_TAILS = ("", "_scale_inv", "_activation_scale")
 
-# Matches one unstacked routed-expert weight, for load-coverage accounting.
-_EXPERT_WEIGHT_RE = re.compile(
-    r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$"
+# Matches one unstacked routed-expert tensor, for load accounting.
+_EXPERT_PARAM_RE = re.compile(
+    r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.(\w+)$"
 )
+# Scale parameters whose family must be seen among the loader's matches.
+_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale")
 
 
 def _translate_mistral4_config(text_config: PretrainedConfig) -> PretrainedConfig:
@@ -181,10 +180,17 @@ def _unstack_stacked_expert(base: str, tail: str, weight: torch.Tensor):
 
     ``tail`` is e.g. ``gate_up_proj`` / ``gate_up_proj_scale_inv`` /
     ``gate_up_proj_activation_scale`` / ``down_proj`` / ``down_proj_scale_inv``
-    / ``down_proj_activation_scale``. The leading (expert) dim indexes experts;
-    gate_up additionally fuses gate and up on the output dim, split for weight
-    and block scale but NOT for the activation (input) scale, which is shared by
-    gate and up and therefore copied.
+    / ``down_proj_activation_scale``. The leading dim always indexes experts.
+
+    Whether the gate/up halves are SPLIT or COPIED depends on what the tensor
+    describes, not on the tail:
+
+    * the weight itself fuses gate and up along the output dim -> split;
+    * a *block* scale has one entry per output block -> split;
+    * a *per-tensor* weight scale is one scalar for the whole expert -> copy it
+      to gate and up. 2603 ships exactly this (``[128, 1, 1]``), and splitting
+      would take the leading dim of a ``[1, 1]`` slice and raise on it being odd;
+    * an activation (input) scale describes the shared input -> copy.
     """
     for stem, targets in (
         ("gate_up_proj", ("gate_proj", "up_proj")),
@@ -193,27 +199,63 @@ def _unstack_stacked_expert(base: str, tail: str, weight: torch.Tensor):
         if not tail.startswith(stem):
             continue
         suffix = tail[len(stem) :]
-        if suffix not in _EXPERT_SUFFIX_MAP:
+        if suffix not in _EXPERT_TAILS:
             break  # unknown suffix -> passthrough below
-        target_suffix = _EXPERT_SUFFIX_MAP[suffix]
-        is_activation = suffix == "_activation_scale"
         fused_gate_up = stem == "gate_up_proj"
         for e in range(weight.shape[0]):
             per_expert = weight[e]
-            if fused_gate_up and not is_activation:
+            if suffix == "":
+                param, splittable = "weight", True
+            elif suffix == "_activation_scale":
+                param, splittable = "input_scale", False
+            else:  # "_scale_inv"
+                param = _scale_param_name(per_expert)
+                splittable = not _is_per_tensor_scale(per_expert)
+
+            if fused_gate_up and splittable:
                 gate, up = _split_gate_up(per_expert, kind=suffix or "weight")
-                yield f"{base}.{e}.gate_proj{target_suffix}", gate
-                yield f"{base}.{e}.up_proj{target_suffix}", up
+                yield f"{base}.{e}.gate_proj.{param}", gate
+                yield f"{base}.{e}.up_proj.{param}", up
             else:
-                # down_proj (all suffixes), or the gate_up activation scale which
-                # is shared by gate and up -> copy to each, never split.
+                # down_proj (single target), or a gate_up scalar shared by gate
+                # and up -> copy to each target, never split.
                 for target in targets:
-                    yield f"{base}.{e}.{target}{target_suffix}", per_expert
+                    yield f"{base}.{e}.{target}.{param}", per_expert
         return
 
     # Unknown expert tail: pass through so deepseek_v2 reports it rather than
     # silently dropping it.
     yield f"{base}.{tail}", weight
+
+
+def _is_per_tensor_scale(scale: torch.Tensor) -> bool:
+    """A single scalar covering the whole (per-expert) tensor, not a block grid."""
+    return scale.numel() == 1
+
+
+def _scale_param_name(scale: torch.Tensor) -> str:
+    """Parameter name SGLang registers for this weight scale.
+
+    fp8 has two layouts and SGLang names them differently:
+
+    * block-quantised (``weight_block_size`` set) -> ``weight_scale_inv``
+      (``w13_weight_scale_inv`` / ``w2_weight_scale_inv`` on a FusedMoE), and
+      that path additionally asserts ``activation_scheme == "dynamic"``;
+    * per-tensor (``weight_block_size: null``) -> ``weight_scale``
+      (``w13_weight_scale`` / ``w2_weight_scale``).
+
+    Mistral-Small-4-119B-2603 is the second kind -- ``activation_scheme: static``
+    with ``weight_block_size: null`` -- yet its checkpoint *keys* are still
+    spelled ``..._scale_inv``. Measured from the published safetensors header:
+    ``experts.gate_up_proj_scale_inv`` and ``experts.down_proj_scale_inv`` are
+    BF16 ``[128, 1, 1]`` (one scalar per expert) and every linear
+    ``weight_scale_inv`` is a BF16 0-d scalar. Taking the checkpoint spelling at
+    face value would target parameters that do not exist: the expert scales
+    would be silently dropped (``if name not in params_dict: continue``) and the
+    fused-qkv / shared-expert branches -- which index ``params_dict[name]``
+    without a guard -- would raise KeyError. So decide by the tensor.
+    """
+    return "weight_scale" if _is_per_tensor_scale(scale) else "weight_scale_inv"
 
 
 def _expert_weight_slot(name: str) -> Optional[tuple]:
@@ -223,21 +265,50 @@ def _expert_weight_slot(name: str) -> Optional[tuple]:
     scheme, so requiring them would make coverage depend on the checkpoint's
     quantization rather than on its structural completeness.
     """
-    match = _EXPERT_WEIGHT_RE.match(name)
-    if match is None:
+    match = _EXPERT_PARAM_RE.match(name)
+    if match is None or match.group(4) != "weight":
         return None
-    layer_id, expert_id, shard = match.groups()
+    layer_id, expert_id, shard, _ = match.groups()
     return int(layer_id), int(expert_id), shard
+
+
+def _expected_param_family(name: str) -> Optional[str]:
+    """The post-mapping family a scale must show up under, or None.
+
+    The loader rewrites ``experts.{e}.gate_proj.`` to ``experts.w13_``, so an
+    emitted ``experts.3.gate_proj.weight_scale`` must land on some
+    ``...experts.w13_weight_scale``. Plain projections keep their trailing
+    parameter name through the fused-qkv / gate_up renames, so a suffix match is
+    enough for them. Only scales are tracked: a wrong scale spelling is the
+    failure that either KeyErrors or silently skips.
+    """
+    match = _EXPERT_PARAM_RE.match(name)
+    if match is not None:
+        shard, param = match.group(3), match.group(4)
+        if param == "weight":
+            return None  # covered by the (layer, expert, shard) grid instead
+        prefix = "w2" if shard == "down" else "w13"
+        return f"experts.{prefix}_{param}"
+    for suffix in _SCALE_SUFFIXES:
+        if name.endswith(suffix):
+            return suffix
+    return None
 
 
 def _adapt_weight_name(name: str, weight: torch.Tensor):
     """Adapt one already-text-layout weight to deepseek_v2's expectations."""
-    # transformers-v5 static-fp8 uses ``.activation_scale`` for the input scale
-    # on non-fused projections (attention, shared experts); deepseek_v2 expects
-    # ``.input_scale``. Fused routed-expert scales use the underscore
-    # ``_activation_scale`` form and are handled by _unstack_stacked_expert.
+    # Plain projections (attention, shared experts). transformers-v5 static-fp8
+    # spells the input scale ``.activation_scale`` and the weight scale
+    # ``.weight_scale_inv`` even when the quantisation is per-tensor; SGLang
+    # registers ``.input_scale`` and (for per-tensor) ``.weight_scale``. Getting
+    # this wrong is not silent here: the fused-qkv and shared-expert branches
+    # index params_dict without a guard and raise KeyError.
+    # Stacked routed-expert scales use the underscore spellings and are handled
+    # by _unstack_stacked_expert.
     if name.endswith(".activation_scale"):
         name = name[: -len(".activation_scale")] + ".input_scale"
+    elif name.endswith(".weight_scale_inv"):
+        name = name[: -len(".weight_scale_inv")] + "." + _scale_param_name(weight)
 
     if ".mlp.experts." not in name:
         yield name, weight
@@ -266,14 +337,15 @@ class Mistral4ForCausalLM(DeepseekV3ForCausalLM):
         super().__init__(config=text_config, quant_config=quant_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Filled as super() consumes the generator, so it is complete by the
-        # time load_weights returns. See _assert_expert_coverage for why the
-        # loader's own matched-parameter set cannot carry this.
+        # Both are filled as super() consumes the generator, so they are complete
+        # by the time load_weights returns. See _assert_expert_coverage for why
+        # the loader's own matched-parameter set cannot carry the grid.
         expert_coverage: set = set()
+        scale_families: set = set()
         loaded = super().load_weights(
-            self._prepare_text_weights(weights, expert_coverage)
+            self._prepare_text_weights(weights, expert_coverage, scale_families)
         )
-        self._assert_key_weights_loaded(loaded)
+        self._assert_key_weights_loaded(loaded, scale_families)
         self._assert_expert_coverage(expert_coverage)
         return loaded
 
@@ -283,6 +355,7 @@ class Mistral4ForCausalLM(DeepseekV3ForCausalLM):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
         expert_coverage: set,
+        scale_families: set,
     ) -> Iterable[tuple[str, torch.Tensor]]:
         for name, weight in weights:
             text_name = _to_text_name(name)
@@ -292,11 +365,14 @@ class Mistral4ForCausalLM(DeepseekV3ForCausalLM):
                 slot = _expert_weight_slot(adapted_name)
                 if slot is not None:
                     expert_coverage.add(slot)
+                family = _expected_param_family(adapted_name)
+                if family is not None:
+                    scale_families.add(family)
                 yield adapted_name, adapted_weight
 
     # ---- post-load validation ---------------------------------------------
 
-    def _assert_key_weights_loaded(self, loaded) -> None:
+    def _assert_key_weights_loaded(self, loaded, scale_families: set = frozenset()) -> None:
         """Fail loudly if a structural parameter never received a checkpoint tensor.
 
         ``loaded`` is the set of parameter names deepseek_v2's loader actually
@@ -349,6 +425,24 @@ class Mistral4ForCausalLM(DeepseekV3ForCausalLM):
                 "prefix / expert-naming mismatch -- capture would otherwise "
                 f"proceed on an uninitialized target. Matched {len(loaded)} "
                 "parameters."
+            )
+
+        # Every scale spelling this adapter emitted must have reached a real
+        # parameter. A wrong fp8 scale name is the quiet failure mode: routed
+        # expert scales are dropped by the loader's `not in params_dict` guard
+        # and the model then runs fp8 weights against default scales.
+        unmatched = [
+            family
+            for family in sorted(scale_families)
+            if not any(name.endswith(family) for name in loaded)
+        ]
+        if unmatched:
+            raise RuntimeError(
+                "Mistral4ForCausalLM: quantization scales were emitted under "
+                f"names no parameter accepted: {unmatched}. The checkpoint's "
+                "fp8 layout and the registered parameter names disagree (e.g. "
+                "per-tensor 'weight_scale' vs block 'weight_scale_inv'); the "
+                "model would run fp8 weights against default scales."
             )
 
     def _assert_expert_coverage(self, expert_coverage: set) -> None:

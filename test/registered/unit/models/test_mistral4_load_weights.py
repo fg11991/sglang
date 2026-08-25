@@ -37,38 +37,48 @@ _EXPERTS = 2
 
 
 def _fake_checkpoint(num_experts=_EXPERTS):
-    """Multimodal ``language_model.*`` layout with v5 stacked experts."""
+    """Multimodal ``language_model.*`` layout, v5 stacked experts, static fp8.
+
+    Scale shapes mirror the published header: per-expert ``[E, 1, 1]`` weight
+    scales, ``[E]`` activation scales, 0-d scalars on plain projections.
+    """
+    L = "language_model.model.layers.0"
     yield "language_model.model.embed_tokens.weight", torch.zeros(4, 4)
     yield "language_model.lm_head.weight", torch.zeros(4, 4)
     yield "language_model.model.norm.weight", torch.zeros(4)
-    yield "language_model.model.layers.0.self_attn.q_a_proj.weight", torch.zeros(4, 4)
-    yield "language_model.model.layers.0.self_attn.kv_a_proj_with_mqa.weight", torch.zeros(
-        4, 4
-    )
-    yield "language_model.model.layers.0.self_attn.kv_b_proj.weight", torch.zeros(4, 4)
-    yield "language_model.model.layers.0.self_attn.o_proj.weight", torch.zeros(4, 4)
-    yield "language_model.model.layers.0.mlp.gate.weight", torch.zeros(num_experts, 4)
-    yield "language_model.model.layers.0.mlp.experts.gate_up_proj", torch.zeros(
-        num_experts, 4, 4
-    )
-    yield "language_model.model.layers.0.mlp.experts.down_proj", torch.zeros(
-        num_experts, 4, 2
-    )
+    for proj in ("q_a_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"):
+        yield f"{L}.self_attn.{proj}.weight", torch.zeros(4, 4)
+        yield f"{L}.self_attn.{proj}.weight_scale_inv", torch.tensor(1.0)
+        yield f"{L}.self_attn.{proj}.activation_scale", torch.tensor(1.0)
+    yield f"{L}.mlp.gate.weight", torch.zeros(num_experts, 4)
+    yield f"{L}.mlp.experts.gate_up_proj", torch.zeros(num_experts, 4, 4)
+    yield f"{L}.mlp.experts.gate_up_proj_scale_inv", torch.ones(num_experts, 1, 1)
+    yield f"{L}.mlp.experts.gate_up_proj_activation_scale", torch.ones(num_experts)
+    yield f"{L}.mlp.experts.down_proj", torch.zeros(num_experts, 4, 2)
+    yield f"{L}.mlp.experts.down_proj_scale_inv", torch.ones(num_experts, 1, 1)
+    yield f"{L}.mlp.experts.down_proj_activation_scale", torch.ones(num_experts)
     # a vision weight that must be dropped
     yield "vision_tower.transformer.layers.0.attention.q_proj.weight", torch.zeros(4, 4)
 
 
-# What the loader reports matched on a healthy load (post-fusion names).
+# What the loader reports matched on a healthy load: post-fusion parameter names,
+# with the scale names a static per-tensor fp8 checkpoint really registers.
 _HEALTHY_MATCHED = {
     "model.embed_tokens.weight",
     "lm_head.weight",
     "model.norm.weight",
     "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight",
+    "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight_scale",
+    "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.input_scale",
     "model.layers.0.self_attn.kv_b_proj.weight",
     "model.layers.0.self_attn.o_proj.weight",
     "model.layers.0.mlp.gate.weight",
     "model.layers.0.mlp.experts.w13_weight",
     "model.layers.0.mlp.experts.w2_weight",
+    "model.layers.0.mlp.experts.w13_weight_scale",
+    "model.layers.0.mlp.experts.w2_weight_scale",
+    "model.layers.0.mlp.experts.w13_input_scale",
+    "model.layers.0.mlp.experts.w2_input_scale",
 }
 
 
@@ -155,6 +165,24 @@ class TestMistral4LoadWeights(CustomTestCase):
         self.assertIn("routed expert", message)
         # 2 missing experts x 3 shards
         self.assertIn("6 of 12", message)
+
+    def test_unmatched_scale_family_raises(self):
+        """A scale spelling no parameter accepted must not pass silently.
+
+        This is the 360-key failure: emitting ``weight_scale_inv`` against a
+        static per-tensor fp8 model, whose parameters are ``weight_scale``.
+        Routed-expert scales are dropped by the loader's `not in params_dict`
+        guard, so without this check the model runs fp8 weights against default
+        scales and only the numerics are wrong.
+        """
+        self._patch_super(
+            _HEALTHY_MATCHED - {"model.layers.0.mlp.experts.w13_weight_scale"}
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            self._instance().load_weights(_fake_checkpoint())
+        message = str(ctx.exception)
+        self.assertIn("experts.w13_weight_scale", message)
+        self.assertIn("scales", message)
 
 
 if __name__ == "__main__":
