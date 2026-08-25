@@ -155,6 +155,12 @@ class DeepseekV2WeightLoaderMixin:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []
+            # Names of parameters an incoming checkpoint tensor actually resolved
+            # to a weight_loader for. Unlike ``weight_names`` (raw checkpoint keys
+            # recorded before any match), this is the set of params that were
+            # genuinely fed a shard, so callers can verify a real load happened.
+            # Accumulated on this single loop thread; the loaders run in futures.
+            matched_params: set = set()
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
@@ -234,6 +240,7 @@ class DeepseekV2WeightLoaderMixin:
                         func=weight_loader,
                         func_args=(param, loaded_weight, shard_id),
                     )
+                    matched_params.add(name)
                     break
                 else:
                     for mapping in expert_params_mapping:
@@ -262,6 +269,7 @@ class DeepseekV2WeightLoaderMixin:
                                 "expert_id": expert_id,
                             },
                         )
+                        matched_params.add(name)
                         break
                     else:
                         # Skip loading extra bias for GPTQ models.
@@ -337,6 +345,7 @@ class DeepseekV2WeightLoaderMixin:
                                     func=weight_loader,
                                     func_args=(param, fused_weight),
                                 )
+                                matched_params.add(param_name)
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
                         else:
@@ -367,12 +376,14 @@ class DeepseekV2WeightLoaderMixin:
                                 func=weight_loader,
                                 func_args=(param, loaded_weight),
                             )
+                            matched_params.add(name)
 
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        return matched_params
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """
