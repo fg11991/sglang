@@ -187,5 +187,36 @@ class TestMistral4ConfigTranslation(CustomTestCase):
             self.assertTrue(is_sparse, f"layer {layer_id} should be MoE")
 
 
+class TestMistral4ExpertLocationConfig(CustomTestCase):
+    """EPLB metadata is built from the TOP-LEVEL config, so it must unwrap too.
+
+    ModelConfigForExpertLocation.from_model_config passes model_config.hf_config
+    -- the multimodal wrapper -- not hf_text_config. Reading n_routed_experts off
+    that wrapper resolves through transformers' composite-config delegation and
+    dies as "'PixtralVisionConfig' object has no attribute 'n_routed_experts'"
+    during ModelRunner init, before a single weight is loaded.
+    """
+
+    def test_unwraps_text_config(self):
+        from sglang.srt.models.mistral4 import Mistral4ForCausalLM
+
+        inner = _make_inner_text_config()
+        outer = _make_outer_config(inner)
+
+        result = Mistral4ForCausalLM.get_model_config_for_expert_location(outer)
+
+        self.assertEqual(result.num_layers, 36)
+        self.assertEqual(result.num_logical_experts, 128)
+        self.assertEqual(result.num_groups, 1)
+
+    def test_flat_config_still_works(self):
+        """A config without a text_config (a hypothetical flat export) passes through."""
+        from sglang.srt.models.mistral4 import Mistral4ForCausalLM
+
+        flat = _make_inner_text_config()
+        result = Mistral4ForCausalLM.get_model_config_for_expert_location(flat)
+        self.assertEqual(result.num_logical_experts, 128)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -336,6 +336,24 @@ class Mistral4ForCausalLM(DeepseekV3ForCausalLM):
         _translate_mistral4_config(text_config)
         super().__init__(config=text_config, quant_config=quant_config, prefix=prefix)
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        """Unwrap the nested text config, as __init__ does.
+
+        SGLang hands the *top-level* config to the model class -- the loader
+        passes ``model_config.hf_config``, and so does
+        ``ModelConfigForExpertLocation.from_model_config``. For this checkpoint
+        that top level is the multimodal ``Mistral3Config``, whose MoE fields
+        (``num_hidden_layers`` / ``n_routed_experts`` / ``n_group``) live on the
+        nested text config; reading them off the wrapper resolves through
+        transformers' composite-config attribute delegation and surfaces as
+        ``AttributeError: 'PixtralVisionConfig' object has no attribute
+        'n_routed_experts'`` during EPLB metadata init.
+        """
+        return super().get_model_config_for_expert_location(
+            getattr(config, "text_config", config)
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Both are filled as super() consumes the generator, so they are complete
         # by the time load_weights returns. See _assert_expert_coverage for why
