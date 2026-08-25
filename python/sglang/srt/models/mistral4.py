@@ -34,19 +34,21 @@ hardware and the transformers>=5.3 mistral4 reference:
   1. Logit parity vs the HF mistral4 reference for one prompt -- proves the
      RoPE variant + MoE routing. An offline DSpark capture is only as correct
      as this.
-  2. FP8 static-activation experts: mistral4's quantization_config is
-     ``activation_scheme: static``, so routed experts carry a per-expert
-     ``*_activation_scale``. deepseek_v2 only wires per-expert input-scale
-     loading for W4A8/W4A16 (make_expert_input_scale_params_mapping), NOT for
-     plain block-fp8. So the ``.input_scale`` names emitted below may have no
-     consuming parameter; the post-load check will report them. Confirm the
-     fp8 activation path against a real load before trusting the numerics.
+  2. FP8 static-activation numerics. The plumbing itself is settled, not open:
+     mistral4 is ``activation_scheme: static`` with ``weight_block_size: null``,
+     and Fp8MoEMethod.create_weights registers ``w13_input_scale`` /
+     ``w2_input_scale`` (shape [num_experts]) for exactly that scheme, which the
+     ordinary expert mapping reaches via
+     ``experts.{e}.gate_proj.`` -> ``experts.w13_``. What still needs the device
+     is whether the resulting fp8 path is numerically right on NPU -- covered by
+     the logit-parity check above.
 ======================================================================
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable
 from typing import Optional
 
@@ -73,13 +75,34 @@ _EXPERT_SUFFIX_MAP = {
     "_activation_scale": ".input_scale",
 }
 
+# Matches one unstacked routed-expert weight, for load-coverage accounting.
+_EXPERT_WEIGHT_RE = re.compile(
+    r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$"
+)
+
 
 def _translate_mistral4_config(text_config: PretrainedConfig) -> PretrainedConfig:
     """Fill the DeepSeek-V2 config attributes mistral4 leaves implicit.
 
-    mistral4 already uses DeepSeek-compatible names for MLA and MoE, so only
-    three things are missing:
+    mistral4 already uses DeepSeek-compatible names for MLA and MoE, but
+    ``Mistral4Config.__init__`` defines none of the following, and we hand the
+    *nested text config* to DeepseekV3 -- so every one of these is missing and
+    the parent would crash during construction, before any weight is loaded:
 
+    * ``architectures`` -- ``PretrainedConfig`` defaults it to ``None`` and
+      ``_patch_text_config`` propagates only pad/bos/eos/tie_word_embeddings, so
+      the JSON architecture override never reaches the text config.
+      ``determine_num_fused_shared_experts`` does ``self.config.architectures[0]``
+      -> ``TypeError: 'NoneType' object is not subscriptable``. Naming it
+      ``Mistral4ForCausalLM`` also correctly *disables* shared-expert fusion
+      (that path is validated only for DeepSeek-V3-shaped 256/384-expert
+      checkpoints; mistral4 stores its shared expert loose).
+    * ``moe_layer_freq`` -- ``DeepseekV2DecoderLayer._is_layer_sparse`` evaluates
+      ``layer_id % self.config.moe_layer_freq``; with ``n_routed_experts=128``
+      and ``first_k_dense_replace=0`` the guard always falls through to it, so a
+      missing attribute is an ``AttributeError`` on layer 0. All 36 layers of
+      2603 carry routed experts (verified against the published index: 36/36
+      have ``mlp.experts``, zero dense MLP layers), hence freq 1.
     * ``topk_method`` / ``scoring_func`` -- mistral4's router is plain softmax
       top-k with renormalization, NOT DeepSeek-V3's correction-bias gate.
       ``topk_method="greedy"`` keeps deepseek_v2 from allocating an
@@ -93,6 +116,8 @@ def _translate_mistral4_config(text_config: PretrainedConfig) -> PretrainedConfi
         if getattr(text_config, name, None) is None:
             setattr(text_config, name, value)
 
+    _set_default("architectures", ["Mistral4ForCausalLM"])
+    _set_default("moe_layer_freq", 1)
     _set_default("topk_method", "greedy")
     _set_default("scoring_func", "softmax")
 
@@ -191,6 +216,20 @@ def _unstack_stacked_expert(base: str, tail: str, weight: torch.Tensor):
     yield f"{base}.{tail}", weight
 
 
+def _expert_weight_slot(name: str) -> Optional[tuple]:
+    """``model.layers.{L}.mlp.experts.{E}.{gate|up|down}_proj.weight`` -> (L, E, shard).
+
+    Only the *weight* itself counts as a slot: scales are optional per quant
+    scheme, so requiring them would make coverage depend on the checkpoint's
+    quantization rather than on its structural completeness.
+    """
+    match = _EXPERT_WEIGHT_RE.match(name)
+    if match is None:
+        return None
+    layer_id, expert_id, shard = match.groups()
+    return int(layer_id), int(expert_id), shard
+
+
 def _adapt_weight_name(name: str, weight: torch.Tensor):
     """Adapt one already-text-layout weight to deepseek_v2's expectations."""
     # transformers-v5 static-fp8 uses ``.activation_scale`` for the input scale
@@ -227,20 +266,33 @@ class Mistral4ForCausalLM(DeepseekV3ForCausalLM):
         super().__init__(config=text_config, quant_config=quant_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded = super().load_weights(self._prepare_text_weights(weights))
+        # Filled as super() consumes the generator, so it is complete by the
+        # time load_weights returns. See _assert_expert_coverage for why the
+        # loader's own matched-parameter set cannot carry this.
+        expert_coverage: set = set()
+        loaded = super().load_weights(
+            self._prepare_text_weights(weights, expert_coverage)
+        )
         self._assert_key_weights_loaded(loaded)
+        self._assert_expert_coverage(expert_coverage)
         return loaded
 
     # ---- weight-name adaptation -------------------------------------------
 
     def _prepare_text_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        expert_coverage: set,
     ) -> Iterable[tuple[str, torch.Tensor]]:
         for name, weight in weights:
             text_name = _to_text_name(name)
             if text_name is None:
                 continue  # vision / projector weight, dropped for text-only
-            yield from _adapt_weight_name(text_name, weight)
+            for adapted_name, adapted_weight in _adapt_weight_name(text_name, weight):
+                slot = _expert_weight_slot(adapted_name)
+                if slot is not None:
+                    expert_coverage.add(slot)
+                yield adapted_name, adapted_weight
 
     # ---- post-load validation ---------------------------------------------
 
@@ -255,26 +307,34 @@ class Mistral4ForCausalLM(DeepseekV3ForCausalLM):
         uninitialized target. Verify the real load happened.
 
         Patterns are the loader's *post-fusion* parameter names: with
-        ``q_lora_rank`` set, q_a/kv_a fuse into ``fused_qkv_a_proj_with_mqa``, and
-        routed experts fuse into ``experts.w13_weight`` / ``experts.w2_weight``.
-        Match a family across any layer so the check is robust to layer sharding.
-        Assumes the offline-capture pp_size=1 (embed / lm_head / final norm live
-        on the single pipeline rank), which the capture backend guarantees.
+        ``q_lora_rank`` set, q_a/kv_a fuse into ``fused_qkv_a_proj_with_mqa``
+        (a separate loader branch from the plain projections, so it needs its own
+        entry), and routed experts fuse into ``experts.w13_weight`` /
+        ``experts.w2_weight``. Match a family across any layer so the check is
+        robust to layer sharding; per-(layer, expert, shard) completeness is
+        checked separately in _assert_expert_coverage, because the fused names
+        cannot express it. Assumes the offline-capture pp_size=1 (embed /
+        lm_head / final norm live on the single pipeline rank), which the
+        capture backend guarantees.
         """
         if loaded is None:
-            logger.warning(
-                "Mistral4ForCausalLM: weight loader returned None; cannot verify "
-                "the target actually loaded (expected DeepseekV2 do_load_weights "
-                "to return its matched-parameter set). Skipping verification."
+            # Verification is the point of this subclass; a base loader that does
+            # not report what it matched makes "the target is initialized"
+            # unprovable, and capture on an uninitialized target fails silently.
+            raise RuntimeError(
+                "Mistral4ForCausalLM: the weight loader returned None instead of "
+                "its matched-parameter set, so the load cannot be verified. "
+                "DeepseekV2ForCausalLM.load_weights must return "
+                "do_load_weights()'s matched_params."
             )
-            return
 
         required = [
             "embed_tokens.weight",
             "lm_head.weight",
             "model.norm.weight",
-            "self_attn.o_proj.weight",
+            "self_attn.fused_qkv_a_proj_with_mqa.weight",
             "self_attn.kv_b_proj.weight",
+            "self_attn.o_proj.weight",
             "mlp.gate.weight",
             "mlp.experts.w13_weight",
             "mlp.experts.w2_weight",
@@ -289,6 +349,58 @@ class Mistral4ForCausalLM(DeepseekV3ForCausalLM):
                 "prefix / expert-naming mismatch -- capture would otherwise "
                 f"proceed on an uninitialized target. Matched {len(loaded)} "
                 "parameters."
+            )
+
+    def _assert_expert_coverage(self, expert_coverage: set) -> None:
+        """Require every (layer, expert, shard) routed-expert weight to be present.
+
+        The loader's matched-parameter set CANNOT express this: its expert branch
+        rewrites ``experts.{e}.gate_proj.`` -> ``experts.w13_``, so all 128
+        experts and both gate/up shards of a layer collapse onto the single name
+        ``...experts.w13_weight``. Half the experts could be missing from the
+        checkpoint and the name-level check would still pass.
+
+        So account on the emitting side instead: every unstacked
+        ``experts.{e}.{gate,up,down}_proj.weight`` this adapter produced is
+        recorded, and compared against what the config says must exist. That
+        proves the checkpoint carried a complete, correctly named expert grid;
+        placing each slot inside the fused parameter is then the loader's own
+        ``weight_loader(param, w, name, shard_id=..., expert_id=...)`` contract.
+
+        Counts the checkpoint stream, not this rank's shard, so it is unaffected
+        by EP/TP/PP (the loader filters after we emit). Assumes the standard
+        one-shot load: a partial/incremental weight-update call would trip it.
+        """
+        num_layers = int(self.config.num_hidden_layers)
+        num_experts = int(self.config.n_routed_experts)
+        first_moe_layer = int(getattr(self.config, "first_k_dense_replace", 0) or 0)
+        moe_layer_freq = int(getattr(self.config, "moe_layer_freq", 1) or 1)
+
+        expected = {
+            (layer_id, expert_id, shard)
+            for layer_id in range(first_moe_layer, num_layers)
+            if layer_id % moe_layer_freq == 0
+            for expert_id in range(num_experts)
+            for shard in ("gate", "up", "down")
+        }
+        missing = expected - expert_coverage
+        if missing:
+            sample = sorted(missing)[:8]
+            raise RuntimeError(
+                "Mistral4ForCausalLM: the checkpoint did not provide every routed "
+                f"expert weight -- {len(missing)} of {len(expected)} "
+                "(layer, expert, gate|up|down) slots are absent, e.g. "
+                f"{sample}. Those experts would keep their uninitialized values. "
+                f"Saw {len(expert_coverage)} slots."
+            )
+        unexpected = expert_coverage - expected
+        if unexpected:
+            logger.warning(
+                "Mistral4ForCausalLM: checkpoint carried %d routed-expert slots "
+                "outside the configured grid (e.g. %s); they were forwarded to "
+                "the loader, which drops unknown names.",
+                len(unexpected),
+                sorted(unexpected)[:4],
             )
 
 

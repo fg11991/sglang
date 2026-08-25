@@ -156,14 +156,20 @@ class TestMistral4ExpertScaleMappingIntegration(CustomTestCase):
     Uses ``FusedMoE.make_expert_params_mapping`` (the exact mapping
     deepseek_weight_loader builds) and replays the loader's
     ``name.replace(weight_name, param_name)`` + ``if name not in params_dict``
-    step against a fake params_dict, exactly like existing MoE loader tests
-    (test_inkling_per_expert_sync) do -- no real quantized layer, CPU only.
+    step against a params_dict holding the names Fp8MoEMethod really registers,
+    like existing MoE loader tests (test_inkling_per_expert_sync) do -- no real
+    quantized layer, CPU only.
 
-    NOTE: whether a block-fp8 *static-activation* FusedMoE actually creates the
-    ``experts.w13_input_scale`` / ``experts.w2_input_scale`` params is the
-    remaining on-device gate (make_expert_input_scale_params_mapping is wired
-    only for W4A8/W4A16). This test proves the NAME threads through so that,
-    when those params exist, the value lands; the fake params_dict includes them.
+    The params_dict is not arbitrary: mistral4 declares
+    ``activation_scheme: "static"`` with ``weight_block_size: null``, and
+    ``Fp8MoEMethod.create_weights`` registers ``w13_input_scale`` /
+    ``w2_input_scale`` (``torch.ones(num_experts)``) for exactly that scheme.
+    The ordinary expert mapping -- not the W4A8-only
+    ``make_expert_input_scale_params_mapping`` -- is what reaches them, because
+    it rewrites the whole ``experts.{e}.gate_proj.`` prefix and so matches the
+    ``.input_scale`` suffix too. Scope: this pins the NAME resolution. Building a
+    real quantized FusedMoE needs a device, so end-to-end fp8 behaviour is
+    covered by the on-device logit-parity run, not here.
     """
 
     def _resolve(self, checkpoint_name, params_dict, mapping):
@@ -192,7 +198,9 @@ class TestMistral4ExpertScaleMappingIntegration(CustomTestCase):
         self.assertIn(gate_key, adapted)
         self.assertIn(up_key, adapted)
 
-        # 2) a FusedMoE exposing the fp8 input-scale params
+        # 2) the params Fp8MoEMethod.create_weights registers for a
+        #    static-activation fp8 checkpoint (fp8.py: activation_scheme ==
+        #    "static" -> register w13_input_scale / w2_input_scale)
         params_dict = {
             "model.layers.0.mlp.experts.w13_input_scale": object(),
             "model.layers.0.mlp.experts.w2_input_scale": object(),

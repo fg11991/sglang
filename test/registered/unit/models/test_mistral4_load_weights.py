@@ -3,16 +3,24 @@
 Guards the load-verification contract without building a real 119B model:
   - the adapted (text-layout, unstacked) weights reach super().load_weights;
   - the returned matched-parameter set is passed through;
-  - a matched set missing a structural family raises (silent prefix / expert
-    drift caught, not trained on an uninitialized target);
-  - a None return (a base loader that does not report matches) does NOT crash
-    -- this is the regression for the original ``loaded is None`` TypeError.
+  - a matched set missing a structural family raises -- including
+    ``fused_qkv_a_proj_with_mqa``, which the loader fills through its own
+    cached_a_proj branch and so can fail independently of o_proj/kv_b_proj;
+  - a None return RAISES: verification is this subclass's whole job, and a
+    loader that will not say what it matched makes an initialized target
+    unprovable (regression for the earlier ``loaded is None`` TypeError, now
+    an explicit error rather than a silent skip);
+  - every (layer, expert, gate|up|down) slot must be present. The loader's own
+    matched set cannot show this -- it rewrites ``experts.{e}.gate_proj.`` to
+    ``experts.w13_``, collapsing all experts and both shards of a layer onto
+    one name -- so coverage is accounted on the emitting side.
 
 super().load_weights is monkeypatched (it would otherwise need a constructed
 model), so this is a CPU unit test.
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -23,27 +31,34 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
-# A minimal real-shaped checkpoint stream (multimodal language_model.* layout,
-# transformers-v5 stacked experts) covering every structural family.
-_E = 2
+# A tiny but structurally complete stand-in for the 36x128 grid.
+_LAYERS = 1
+_EXPERTS = 2
 
 
-def _fake_checkpoint():
+def _fake_checkpoint(num_experts=_EXPERTS):
+    """Multimodal ``language_model.*`` layout with v5 stacked experts."""
     yield "language_model.model.embed_tokens.weight", torch.zeros(4, 4)
     yield "language_model.lm_head.weight", torch.zeros(4, 4)
     yield "language_model.model.norm.weight", torch.zeros(4)
     yield "language_model.model.layers.0.self_attn.q_a_proj.weight", torch.zeros(4, 4)
-    yield "language_model.model.layers.0.self_attn.kv_a_proj_with_mqa.weight", torch.zeros(4, 4)
+    yield "language_model.model.layers.0.self_attn.kv_a_proj_with_mqa.weight", torch.zeros(
+        4, 4
+    )
     yield "language_model.model.layers.0.self_attn.kv_b_proj.weight", torch.zeros(4, 4)
     yield "language_model.model.layers.0.self_attn.o_proj.weight", torch.zeros(4, 4)
-    yield "language_model.model.layers.0.mlp.gate.weight", torch.zeros(_E, 4)
-    yield "language_model.model.layers.0.mlp.experts.gate_up_proj", torch.zeros(_E, 4, 4)
-    yield "language_model.model.layers.0.mlp.experts.down_proj", torch.zeros(_E, 4, 2)
+    yield "language_model.model.layers.0.mlp.gate.weight", torch.zeros(num_experts, 4)
+    yield "language_model.model.layers.0.mlp.experts.gate_up_proj", torch.zeros(
+        num_experts, 4, 4
+    )
+    yield "language_model.model.layers.0.mlp.experts.down_proj", torch.zeros(
+        num_experts, 4, 2
+    )
     # a vision weight that must be dropped
     yield "vision_tower.transformer.layers.0.attention.q_proj.weight", torch.zeros(4, 4)
 
 
-# What the loader would report matched on a healthy load (post-fusion names).
+# What the loader reports matched on a healthy load (post-fusion names).
 _HEALTHY_MATCHED = {
     "model.embed_tokens.weight",
     "lm_head.weight",
@@ -64,21 +79,33 @@ class TestMistral4LoadWeights(CustomTestCase):
     def tearDown(self):
         DeepseekV3ForCausalLM.load_weights = self._orig
 
-    def _instance(self):
+    def _instance(self, num_experts=_EXPERTS):
         # Skip the real __init__ (which builds the whole model).
-        return object.__new__(Mistral4ForCausalLM)
+        inst = object.__new__(Mistral4ForCausalLM)
+        inst.config = SimpleNamespace(
+            num_hidden_layers=_LAYERS,
+            n_routed_experts=num_experts,
+            first_k_dense_replace=0,
+            moe_layer_freq=1,
+        )
+        return inst
+
+    @staticmethod
+    def _patch_super(matched, seen=None):
+        def fake_super(self, weights, *args, **kwargs):
+            names = [name for name, _ in weights]
+            if seen is not None:
+                seen["names"] = names
+            return matched
+
+        DeepseekV3ForCausalLM.load_weights = fake_super
 
     def test_adapts_weights_and_passes_through_matched_set(self):
         seen = {}
+        self._patch_super(set(_HEALTHY_MATCHED), seen)
 
-        def fake_super(self, weights, *args, **kwargs):
-            seen["names"] = [name for name, _ in weights]
-            return set(_HEALTHY_MATCHED)
-
-        DeepseekV3ForCausalLM.load_weights = fake_super
         result = self._instance().load_weights(_fake_checkpoint())
 
-        # Prefix stripped to DeepSeek layout, vision dropped, experts unstacked.
         self.assertIn("model.embed_tokens.weight", seen["names"])
         self.assertIn("model.layers.0.mlp.experts.0.gate_proj.weight", seen["names"])
         self.assertIn("model.layers.0.mlp.experts.1.down_proj.weight", seen["names"])
@@ -90,28 +117,44 @@ class TestMistral4LoadWeights(CustomTestCase):
             any("language_model." in n for n in seen["names"]),
             "language_model. prefix must be stripped",
         )
-        # The matched set is returned unchanged.
         self.assertEqual(result, _HEALTHY_MATCHED)
 
     def test_missing_structural_family_raises(self):
-        def fake_super(self, weights, *args, **kwargs):
-            list(weights)  # consume
-            return _HEALTHY_MATCHED - {"model.layers.0.mlp.experts.w13_weight"}
-
-        DeepseekV3ForCausalLM.load_weights = fake_super
+        self._patch_super(_HEALTHY_MATCHED - {"model.layers.0.mlp.experts.w13_weight"})
         with self.assertRaises(RuntimeError) as ctx:
             self._instance().load_weights(_fake_checkpoint())
         self.assertIn("experts.w13_weight", str(ctx.exception))
 
-    def test_none_matched_set_does_not_crash(self):
-        # Regression: `loaded is None` must not raise TypeError.
-        def fake_super(self, weights, *args, **kwargs):
-            list(weights)
-            return None
+    def test_missing_fused_qkv_a_proj_raises(self):
+        # Its own loader branch (cached_a_proj), so it can fail on its own.
+        self._patch_super(
+            _HEALTHY_MATCHED
+            - {"model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight"}
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            self._instance().load_weights(_fake_checkpoint())
+        self.assertIn("fused_qkv_a_proj_with_mqa", str(ctx.exception))
 
-        DeepseekV3ForCausalLM.load_weights = fake_super
-        # Should complete without raising.
-        self.assertIsNone(self._instance().load_weights(_fake_checkpoint()))
+    def test_none_matched_set_raises(self):
+        self._patch_super(None)
+        with self.assertRaises(RuntimeError) as ctx:
+            self._instance().load_weights(_fake_checkpoint())
+        self.assertIn("None", str(ctx.exception))
+
+    def test_full_expert_grid_passes(self):
+        self._patch_super(set(_HEALTHY_MATCHED))
+        # 1 layer x 2 experts x {gate, up, down} all present -> no raise.
+        self._instance().load_weights(_fake_checkpoint())
+
+    def test_incomplete_expert_grid_raises(self):
+        # Model expects 4 experts; the checkpoint only carries 2.
+        self._patch_super(set(_HEALTHY_MATCHED))
+        with self.assertRaises(RuntimeError) as ctx:
+            self._instance(num_experts=4).load_weights(_fake_checkpoint(num_experts=2))
+        message = str(ctx.exception)
+        self.assertIn("routed expert", message)
+        # 2 missing experts x 3 shards
+        self.assertIn("6 of 12", message)
 
 
 if __name__ == "__main__":
