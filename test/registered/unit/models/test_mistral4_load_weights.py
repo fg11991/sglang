@@ -145,6 +145,30 @@ class TestMistral4LoadWeights(CustomTestCase):
             self._instance().load_weights(_fake_checkpoint())
         self.assertIn("fused_qkv_a_proj_with_mqa", str(ctx.exception))
 
+    def test_scale_sibling_does_not_satisfy_weight_requirement(self):
+        """A loaded scale must not stand in for the weight it scales.
+
+        The families are matched by suffix, not substring. Under substring
+        matching "mlp.experts.w13_weight" was satisfied by the sibling
+        "mlp.experts.w13_weight_scale", so a load where the expert weights never
+        arrived -- but their scales did -- passed the check silently, which is
+        the exact failure this assertion exists to catch.
+        """
+        weight_only = {
+            "model.layers.0.mlp.experts.w13_weight",
+            "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight",
+        }
+        # Every weight replaced by its scale sibling; scales alone must not pass.
+        matched = (_HEALTHY_MATCHED - weight_only) | {
+            name + "_scale" for name in weight_only
+        }
+        self._patch_super(matched)
+        with self.assertRaises(RuntimeError) as ctx:
+            self._instance().load_weights(_fake_checkpoint())
+        message = str(ctx.exception)
+        self.assertIn("mlp.experts.w13_weight", message)
+        self.assertIn("fused_qkv_a_proj_with_mqa.weight", message)
+
     def test_none_matched_set_raises(self):
         self._patch_super(None)
         with self.assertRaises(RuntimeError) as ctx:

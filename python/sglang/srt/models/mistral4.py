@@ -415,8 +415,14 @@ class Mistral4ForCausalLM(DeepseekV3ForCausalLM):
             "mlp.experts.w13_weight",
             "mlp.experts.w2_weight",
         ]
+        # Suffix match, NOT substring: a ".weight" requirement must be satisfied
+        # by the weight parameter itself, never by a sibling that merely starts
+        # the same way. Substring matching let "mlp.experts.w13_weight" be
+        # satisfied by "mlp.experts.w13_weight_scale", so a checkpoint whose
+        # expert weights never loaded -- but whose scales did -- passed this
+        # check, which is exactly the silent failure it exists to catch.
         missing = [
-            key for key in required if not any(key in name for name in loaded)
+            key for key in required if not any(name.endswith(key) for name in loaded)
         ]
         if missing:
             raise RuntimeError(
