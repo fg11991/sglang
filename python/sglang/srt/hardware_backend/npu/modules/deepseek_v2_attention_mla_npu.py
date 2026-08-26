@@ -25,6 +25,36 @@ if TYPE_CHECKING:
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 
+# CANN kv_rms_norm_rope_cache_ds_tiling.cpp:203 —— rms_norm last dim 只支持 512/192
+_KV_RMSNORM_ROPE_CACHE_SUPPORTED_RANKS = frozenset({192, 512})
+
+
+def _exec_kv_unfused(m, latent_cache_bnsd, cos, sin, forward_batch):
+    """kv_lora_rank 不在算子白名单时的手搓路径。
+
+    语义等价于 npu_kv_rmsnorm_rope_cache(is_output_kv=True)：
+    rms_norm(k_nope) + interleave_rope(k_pe) + 写 KV cache。
+    """
+    assert not is_fia_nz(), "unfused MLA KV path 只支持 PA_BNSD 布局"
+
+    k_nope, k_pe = latent_cache_bnsd.split(
+        [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
+    )
+    k_nope, _ = torch_npu.npu_rms_norm(
+        k_nope.contiguous(),
+        m.kv_a_layernorm.weight,
+        epsilon=m.kv_a_layernorm.variance_epsilon,
+    )
+    k_pe = torch_npu.npu_interleave_rope(k_pe.contiguous(), cos, sin)
+
+    get_token_to_kv_pool().set_kv_buffer(
+        m,
+        forward_batch.out_cache_loc,
+        k_nope.view(-1, 1, m.kv_lora_rank),
+        k_pe.view(-1, 1, m.qk_rope_head_dim),
+    )
+    return k_pe, k_nope.view(-1, m.kv_lora_rank)
+
 # region MHA
 def forward_mha_prepare_npu(
     m: "DeepseekV2AttentionMLA",
@@ -89,23 +119,32 @@ def forward_mha_prepare_npu(
         )
         q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
-        ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
-        _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
-            latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
-            m.kv_a_layernorm.weight,
-            cos,
-            sin,
-            forward_batch.out_cache_loc.to(torch.int64),
-            k_rope_cache,
-            ckv_cache,
-            k_rope_scale=None,
-            c_kv_scale=None,
-            k_rope_offset=None,
-            c_kv_offset=None,
-            epsilon=m.kv_a_layernorm.variance_epsilon,
-            cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
-            is_output_kv=True,
-        )  # adapter NZ
+        latent_cache_bnsd = latent_cache.view(
+            -1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim
+        )
+
+        if m.kv_lora_rank in _KV_RMSNORM_ROPE_CACHE_SUPPORTED_RANKS:
+            ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
+            _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
+                latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
+                m.kv_a_layernorm.weight,
+                cos,
+                sin,
+                forward_batch.out_cache_loc.to(torch.int64),
+                k_rope_cache,
+                ckv_cache,
+                k_rope_scale=None,
+                c_kv_scale=None,
+                k_rope_offset=None,
+                c_kv_offset=None,
+                epsilon=m.kv_a_layernorm.variance_epsilon,
+                cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
+                is_output_kv=True,
+            )  # adapter NZ
+        else:
+            k_pe, kv_a = _exec_kv_unfused(
+                m, latent_cache_bnsd, cos, sin, forward_batch
+            )
 
         k_pe = k_pe.reshape(B, -1, m.qk_rope_head_dim)
     else:

@@ -79,6 +79,68 @@ _EXPERT_PARAM_RE = re.compile(
 # Scale parameters whose family must be seen among the loader's matches.
 _SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale")
 
+from collections.abc import Iterable, Iterator
+
+FP8_DTYPES = tuple(
+    getattr(torch, n) for n in
+    ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz")
+    if hasattr(torch, n)
+)
+
+def _dequant(w, s):
+    if s.numel() == 1:
+        pass
+    elif (w.ndim == 3 and s.ndim == 3
+          and s.shape[0] == w.shape[0] and s.shape[1:] == (1, 1)):
+        pass
+    else:
+        raise ValueError(f"bad scale shape: w={tuple(w.shape)}, s={tuple(s.shape)}")
+    # 名字叫 _inv，但操作是【乘】
+    return w.to(torch.bfloat16) * s.to(torch.bfloat16)
+
+def fp8_dequant_iter(weights: Iterable) -> Iterator:
+    pending_w, pending_s = {}, {}
+    n = 0
+    for name, w in weights:
+        if name.endswith(("activation_scale", ".input_scale", ".qscale_act")):
+            continue
+        if name.endswith("_scale_inv"):
+            wname = name[: -len("_scale_inv")]
+        elif name.endswith(".weight_scale"):
+            wname = name[: -len("_scale")]
+        elif name.endswith(".qscale_weight"):
+            wname = name[: -len(".qscale_weight")] + ".weight"
+        else:
+            wname = None
+
+        if wname is not None:
+            pw = pending_w.pop(wname, None)
+            if pw is None:
+                pending_s[name] = w
+                continue
+            w, name = _dequant(pw, w), wname
+            n += 1
+        elif w.dtype in FP8_DTYPES:
+            ps = None
+            cands = [f"{name}_scale_inv", f"{name}_scale"]
+            if name.endswith(".weight"):
+                cands.append(name[: -len(".weight")] + ".qscale_weight")
+            for c in cands:
+                ps = pending_s.pop(c, None)
+                if ps is not None:
+                    break
+            if ps is None:
+                pending_w[name] = w
+                continue
+            w = _dequant(w, ps)
+            n += 1
+        yield name, w
+
+    if pending_w or pending_s:
+        raise ValueError(
+            f"unpaired: weights={sorted(pending_w)[:5]}, scales={sorted(pending_s)[:5]}")
+    print(f"[dequant] converted {n} fp8 tensors to bf16")
+
 
 def _translate_mistral4_config(text_config: PretrainedConfig) -> PretrainedConfig:
     """Fill the DeepSeek-V2 config attributes mistral4 leaves implicit.
@@ -358,6 +420,7 @@ class Mistral4ForCausalLM(DeepseekV3ForCausalLM):
         # Both are filled as super() consumes the generator, so they are complete
         # by the time load_weights returns. See _assert_expert_coverage for why
         # the loader's own matched-parameter set cannot carry the grid.
+        weights = fp8_dequant_iter(weights)
         expert_coverage: set = set()
         scale_families: set = set()
         loaded = super().load_weights(
